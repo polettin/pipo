@@ -22,12 +22,29 @@ import hashlib
 import json
 import math
 import operator
+import os
 import random
 import re
 import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
+
+
+def escrever_atomico(caminho, texto):
+    """Escreve em arquivo temporário e troca no lugar: uma queda de energia no
+    meio da escrita nunca deixa o JSON pela metade (o que zeraria a memória).
+    Se o arquivo antigo existia, guarda uma cópia .bak antes de trocar."""
+    caminho = Path(caminho)
+    temporario = caminho.with_name(caminho.name + ".tmp")
+    temporario.write_text(texto, encoding="utf-8")
+    if caminho.exists():
+        try:
+            backup = caminho.with_name(caminho.name + ".bak")
+            backup.write_bytes(caminho.read_bytes())
+        except OSError:
+            pass                       # backup é cortesia; a troca é o que importa
+    os.replace(temporario, caminho)
 
 SEMANA = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]
 MESES = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto",
@@ -40,6 +57,24 @@ REMIX_MIN_FRASES = 40     # tamanho mínimo do texto de uma personalidade para e
 CRISE = ("quero morrer", "vou me matar", "me matar", "suicid", "nao quero mais viver",
          "nao aguento mais viver", "acabar com minha vida", "acabar com tudo", "me machucar",
          "me cortar", "tirar minha vida", "queria sumir para sempre")
+# Combinações soltas: o usuário raramente digita a frase exata da lista acima
+# ("as vezes penso em nao querer mais viver" não bate com 'nao quero mais viver'
+# por causa das palavras no meio). Falso positivo aqui custa um acolhimento a
+# mais; falso negativo, com a IA local ligada, mandaria a frase ao modelo.
+CRISE_COMBINADA = [("morrer", ("quero", "pens", "melhor", "acho que seria melhor")),
+                   ("morte", ("minha", "pra mim", "pro meu")),
+                   ("viver", ("nao quero", "nao aguento", "sem vontade", "sem sentido", "cansad", "penso em nao")),
+                   # "não faz/cansa/faz doer" + vida, e nunca o elogio "isso sim é vida!"
+                   ("vida", ("tirar", "acabar", "nao tem mais sentido", "sem sentido",
+                              "cansa essa vida", "truncada", "acabou pra mim")),
+                   # verbo junto do desejo ("quero/to/queria sumir"); sem pronome pessoal,
+                   # "sumir de fim de semana" comum não dispara.
+                   ("sumir", ("quero sumir", "to sumir", "pra sumir", "para sumir", "quiser sumir")),
+                   ("acabar", ("comigo", "com a minha vida")),
+                   # "continuar vivo" sem vontade; nunca a empolgação ("bora continuar vivo!")
+                   ("continuar vivo", ("nao quero", "sem vontade", "penso em nao", "cansad",
+                                       "nao vejo sentido", "perdi a vontade")),
+                   ("desaparecer", ("pra sempre", "para sempre", "de tudo", "quero"))]
 ACOLHIMENTO = [
     "Sinto muito que você esteja assim. Você não precisa passar por isso sozinho: no Brasil, o CVV "
     "atende 24 horas pelo 188 (cvv.org.br). Se houver risco agora, ligue 192 (SAMU) ou chame alguém "
@@ -296,10 +331,13 @@ class Cerebro:
         self.rng = random.Random(semente)
         self.estado = {"fb": {}, "fatos": {}, "recentes": [], "remix_ruim": [], "pendentes": {},
                        "braco": {"curada": [0, 0], "remix": [0, 0]}}
-        try:
-            self.estado.update(json.loads(self.arq.read_text(encoding="utf-8")))
-        except Exception:
-            pass
+        self.estado_corrompido = False
+        if self.arq.exists():
+            try:
+                self.estado.update(json.loads(self.arq.read_text(encoding="utf-8")))
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                # estado ilegível: mantém os padrões, mas avisa (a troca guarda o .bak)
+                self.estado_corrompido = True
         self.treinar()
 
     # ---- leitura dos arquivos de dados ----
@@ -356,8 +394,8 @@ class Cerebro:
 
     def salvar(self):
         try:
-            self.arq.write_text(json.dumps(self.estado, ensure_ascii=False, indent=1), encoding="utf-8")
-        except Exception:
+            escrever_atomico(self.arq, json.dumps(self.estado, ensure_ascii=False, indent=1))
+        except OSError:
             pass
 
     # ---- variáveis para preencher as frases ----
@@ -449,7 +487,12 @@ class Cerebro:
     # ---- conversa ----
     def seguranca(self, texto):
         t = normalizar(texto)
-        return any(c in t for c in CRISE)
+        if "suicid" in t:  # estudar/falar sobre suicídio é assunto sério, não necessariamente crise pessoal
+            return any(g in t for g in ("quero", "pens", "vou me", "minha vida", "as vezes"))
+        if any(c in t for c in CRISE):
+            return True
+        return any(alvo in t and any(p in t for p in gatilhos)
+                   for alvo, gatilhos in CRISE_COMBINADA)
 
     REGRAS = [
         ("dia_semana", r"\bdia da semana\b|\bque dia da semana\b|\bhoje e (segunda|terca|quarta|quinta|sexta|sabado|domingo)\b"),
@@ -605,11 +648,21 @@ class Cerebro:
         self.salvar()
 
     def ensinar(self, pergunta, resposta, persona=None):
-        linha = f"{pergunta.strip()} | {resposta.strip()}" + (f" | {persona}" if persona else "")
+        # o formato do arquivo é "pergunta | resposta | personas": "|" no meio
+        # quebraria as colunas; "#" no começo faria a linha virar comentário.
+        limpar = lambda s: re.sub(r"[|#]", " ", str(s)).strip()
+        pergunta, resposta = limpar(pergunta), limpar(resposta)
+        if not pergunta or not resposta:
+            return False
+        linha = f"{pergunta} | {resposta}" + (f" | {limpar(persona)}" if persona else "")
+        arq = self.pasta / "aprendido.txt"
         try:
-            with open(self.pasta / "aprendido.txt", "a", encoding="utf-8") as f:
-                f.write(linha + "\n")
-        except Exception:
+            existente = arq.read_text(encoding="utf-8") if arq.exists() else ""
+            # sem "\n" final no arquivo antigo, o append colava a linha nova na última
+            prefixo = "" if (not existente or existente.endswith("\n")) else "\n"
+            with open(arq, "a", encoding="utf-8") as f:
+                f.write(prefixo + linha + "\n")
+        except OSError:
             return False
         self.treinar()
         return True

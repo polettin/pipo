@@ -149,7 +149,10 @@ def carregar(arq, padrao):
 
 
 def salvar(arq, dados):
-    arq.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
+    # escrita atômica: nunca deixa o JSON pela metade se faltar energia no meio
+    temporario = arq.with_name(arq.name + ".tmp")
+    temporario.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporario, arq)
 
 
 LARGURA = int(320 * ESCALA)
