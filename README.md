@@ -1,3 +1,11 @@
+Rodando em Linux (experimental, com degradação graciosa)
+O Pipo foi feito para Windows, que é onde ele briga de verdade (andar por cima das janelas, transparência de verdade, sons). Em Linux ele abre e conversa, com estas diferenças:
+- Observação de atividade e passeio entre janelas: só no X11, com xdotool instalado (sudo apt install xdotool xprintidle). No Wayland o próprio protocolo não deixa nenhuma aplicação ver as janelas das outras — a observação fica pausada e o passeio usa um chão só.
+- Transparência: fora do Windows o Tkinter não tem cor transparente por janela; a janelinha fica levemente translúcida (-alpha).
+- Sons: bipes gerados na hora e tocados no paplay/aplay; sem player, silêncio.
+- Fontes: DejaVu Sans no lugar das Segoe/Consolas.
+Nada para instalar além do Python 3 com Tkinter (sudo apt install python3-tk).
+
 PIPO ML  -  o Pipo com machine learning (sem nenhuma IA externa)
 =================================================================
 

@@ -32,11 +32,16 @@ import math
 import os
 import queue
 import random
+import shutil
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
+
+WINDOWS = sys.platform == "win32"
 
 try:
     import winsound  # sons (só existe no Windows)
@@ -101,10 +106,30 @@ PERSONAS = {
                   "pausa": ["Pausa. Agora. Não discute."]},
 }
 
-try:  # evita personagem borrado/errado em monitores com escalas diferentes
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+try:  # evita personagem borrado/errado em monitores com escalas diferentes (só Windows)
+    if WINDOWS:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # type: ignore[attr-defined]
 except Exception:
     pass
+
+# Fontes por plataforma: Segoe é exclusiva do Windows; fora dele, as equivalentes do sistema.
+if WINDOWS:
+    F_TEXTO, F_SIMBOLO, F_MONO, F_CANETA = "Segoe UI", "Segoe UI Symbol", "Consolas", "Segoe Print"
+else:
+    F_TEXTO = F_SIMBOLO = F_MONO = F_CANETA = "DejaVu Sans"
+
+
+def abrir_pasta(caminho):
+    """Abre a pasta de dados no gerenciador de arquivos de cada sistema."""
+    try:
+        if WINDOWS:
+            os.startfile(caminho)                    # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(caminho)])
+        else:
+            subprocess.Popen(["xdg-open", str(caminho)])
+    except (OSError, FileNotFoundError):
+        pass
 
 PASTA = Path(__file__).resolve().parent
 DADOS = PASTA / "dados"
@@ -210,9 +235,16 @@ MELODIAS = {
 def area_virtual():
     """(x, y, largura, altura) de todos os monitores juntos, ou None se não der para saber."""
     try:
-        u = ctypes.windll.user32
-        return (u.GetSystemMetrics(76), u.GetSystemMetrics(77),
-                u.GetSystemMetrics(78), u.GetSystemMetrics(79))
+        if WINDOWS:
+            u = ctypes.windll.user32                     # type: ignore[attr-defined]
+            return (u.GetSystemMetrics(76), u.GetSystemMetrics(77),
+                    u.GetSystemMetrics(78), u.GetSystemMetrics(79))
+        if sys.platform == "linux" and os.environ.get("DISPLAY") and shutil.which("xdotool"):
+            tam = subprocess.run(["xdotool", "getdisplaygeometry"],
+                                 capture_output=True, text=True, timeout=2).stdout.split()
+            if len(tam) == 2:                            # área virtual no X11 começa em (0,0)
+                return (0, 0, int(tam[0]), int(tam[1]))
+        return None
     except Exception:
         return None
 
@@ -276,10 +308,45 @@ class _UltimaEntrada(ctypes.Structure):
     _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
 
 
+def _janela_x11():
+    """(programa, título, pid) da janela em foco no X11 via xdotool (None fora do X11).
+    No Wayland isso é bloqueado pelo próprio protocolo — o Pipo segue sem observar."""
+    if not os.environ.get("DISPLAY") or shutil.which("xdotool") is None:
+        return None
+    try:
+        wid = subprocess.run(["xdotool", "getactivewindow"], capture_output=True,
+                             text=True, timeout=2).stdout.strip()
+        if not wid.isdigit():
+            return None
+        pid = subprocess.run(["xdotool", "getwindowpid", wid], capture_output=True,
+                             text=True, timeout=2).stdout.strip()
+        titulo = subprocess.run(["xdotool", "getwindowname", wid], capture_output=True,
+                                text=True, timeout=2).stdout.strip()
+        exe = "?"
+        if pid.isdigit():
+            nome = Path(f"/proc/{pid}/comm")
+            if nome.exists():
+                exe = nome.read_text().strip().lower() or "?"
+        return exe, titulo, int(pid) if pid.isdigit() else 0
+    except Exception:
+        return None
+
+
+def _ocioso_x11():
+    """Segundos sem entrada no X11 (xprintidle); 0.0 se a ferramenta não existir."""
+    if not os.environ.get("DISPLAY") or shutil.which("xprintidle") is None:
+        return 0.0
+    try:
+        ms = subprocess.run(["xprintidle"], capture_output=True, text=True, timeout=2).stdout.strip()
+        return int(ms) / 1000.0 if ms.isdigit() else 0.0
+    except Exception:
+        return 0.0
+
+
 def janela_ativa():
     """(programa.exe, título, pid) da janela em foco, ou None se não der para saber."""
     if not WIN_OK:
-        return None
+        return _janela_x11()
     try:
         hwnd = _U.GetForegroundWindow()
         if not hwnd:
@@ -307,7 +374,7 @@ def janela_ativa():
 def segundos_ocioso():
     """Há quantos segundos o usuário não mexe no mouse nem no teclado."""
     if not WIN_OK:
-        return 0.0
+        return _ocioso_x11()
     try:
         li = _UltimaEntrada()
         li.cbSize = ctypes.sizeof(li)
@@ -703,7 +770,13 @@ class Pipo:
         try:
             self.root.attributes("-transparentcolor", TRANSP)
         except tk.TclError:
-            pass  # só existe no Windows
+            pass  # só existe no Windows; fora dele a janela fica com o fundo magenta
+                  # atenuado por -alpha, que qualquer compositor entende
+            if not WINDOWS:
+                try:
+                    self.root.attributes("-alpha", 0.92)
+                except tk.TclError:
+                    pass
         self.root.config(bg=TRANSP)
         est = carregar(ARQ_ESTADO, {})
         self.sons = bool(est.get("sons", SONS))
@@ -800,7 +873,7 @@ class Pipo:
             if nome == "dormir" and z:
                 rotulo = "acordar"
             rot = c.create_text(cx, cy + 36, text=rotulo, fill="#d9d4e0",
-                                font=("Segoe UI", -self.fpx(12)), tags=tag)
+                                font=(F_TEXTO, -self.fpx(12)), tags=tag)
             if nome == "dormir":
                 self.rot_dormir = rot
         c.scale("all", 0, 0, self.esc, self.esc)
@@ -821,7 +894,7 @@ class Pipo:
         elif nome == "dormir":
             self.glifo_dormir = c.create_text(
                 cx, cy, text="☀" if self.dormindo else "☾", fill=cor,
-                font=("Segoe UI Symbol", -self.fpx(22)), tags=tag)
+                font=(F_SIMBOLO, -self.fpx(22)), tags=tag)
         elif nome == "ver":
             c.create_oval(cx - 11, cy - 7, cx + 11, cy + 7, outline=cor, width=2, tags=tag)
             c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=cor, outline="", tags=tag)
@@ -883,7 +956,7 @@ class Pipo:
         tinta = "#ffffff"
         if self.modo == "tela":
             c.create_text(22, 26, text=datetime.now().strftime("%H:%M"), anchor="w", fill="#ffffff",
-                          font=("Segoe UI", -self.fpx(15), "bold"), tags="din")
+                          font=(F_TEXTO, -self.fpx(15), "bold"), tags="din")
             if self.dormindo:
                 txt, cor = "pausado", "#9aa0b4"
             elif self.observar:
@@ -892,14 +965,14 @@ class Pipo:
                 txt, cor = "não observa", "#d9d4e0"
             c.create_oval(206, 20, 214, 28, fill=cor, outline="", tags="din")
             c.create_text(220, 24, text=txt, anchor="w", fill="#d9d4e0",
-                          font=("Segoe UI", -self.fpx(13)), tags="din")
+                          font=(F_TEXTO, -self.fpx(13)), tags="din")
             if self.notas:
                 c.create_text(120, 24, text=f"✎ {len(self.notas)}", anchor="w", fill="#d9d4e0",
-                              font=("Segoe UI Symbol", -self.fpx(13)), tags="din")
+                              font=(F_SIMBOLO, -self.fpx(13)), tags="din")
             c.create_text(22, 224, text=self.cerebro.resumo_curto(), anchor="w",
-                          fill="#8fb4b9", font=("Segoe UI", -self.fpx(12)), tags="din")
+                          fill="#8fb4b9", font=(F_TEXTO, -self.fpx(12)), tags="din")
             c.create_text(298, 224, text=PERSONAS[self.persona]["nome"].lower() + (" · auto" if self.auto else ""), anchor="e",
-                          fill="#8fb4b9", font=("Segoe UI", -self.fpx(12)), tags="din")
+                          fill="#8fb4b9", font=(F_TEXTO, -self.fpx(12)), tags="din")
             pulo = 4 if (self.fase and not self.dormindo) else 0
             self.desenhar_pet(112, 110 - pulo, 6)
             ox, oy, fs = 218, 126, 20
@@ -917,16 +990,16 @@ class Pipo:
             ys = yf = yx = yz
         if h == "dormindo":
             c.create_text(xz, yz, text="Z" if self.fase else "z", fill=tinta, tags="din",
-                          font=("Consolas", -self.fpx(fs), "bold"))
+                          font=(F_MONO, -self.fpx(fs), "bold"))
         elif h == "sonolento":
             c.create_text(ox, ys, text="z", fill=tinta, tags="din",
-                          font=("Consolas", -self.fpx(fs), "bold"))
+                          font=(F_MONO, -self.fpx(fs), "bold"))
         elif h == "feliz":
             c.create_text(ox, yf, text="♥", fill="#ff6b81", tags="din",
-                          font=("Segoe UI Symbol", -self.fpx(fs), "bold"))
+                          font=(F_SIMBOLO, -self.fpx(fs), "bold"))
         elif h == "surpreso":
             c.create_text(ox, yx, text="!", fill=tinta, tags="din",
-                          font=("Consolas", -self.fpx(fs + 2), "bold"))
+                          font=(F_MONO, -self.fpx(fs + 2), "bold"))
         c.scale("din", 0, 0, self.esc, self.esc)
 
     def tick(self):
@@ -937,16 +1010,62 @@ class Pipo:
         self.root.after(500, self.tick)
 
     def tocar(self, nome):
-        if not (self.sons and winsound):
+        if not self.sons:
             return
+        if winsound:
+            melodias = MELODIAS[nome]
 
-        def run():
-            for freq, ms in MELODIAS[nome]:
+            def run():
+                for freq, ms in melodias:
+                    try:
+                        winsound.Beep(freq, ms)
+                    except Exception:
+                        return
+            threading.Thread(target=run, daemon=True).start()
+        else:
+            self._tocar_linux(nome)
+
+    def _tocar_linux(self, nome):
+        """Bipes no Linux/macOS: beep do sistema se houver player, senão silêncio."""
+        tocador = shutil.which("paplay") or shutil.which("aplay") or shutil.which("pw-play")
+        if not tocador:
+            return
+        try:  # bipe curto pelo beep do sistema; some se o som do PC estiver mudo
+            subprocess.run(["beep", "-f", "880", "-l", "60"], capture_output=True, timeout=1) \
+                if shutil.which("beep") else self._bipe_wav(tocador, MELODIAS[nome])
+        except Exception:
+            pass
+
+    @staticmethod
+    def _bipe_wav(tocador, melodias):
+        """Gera um WAV de bipes em memória (biblioteca padrão) e toca no player do sistema."""
+        import math as _m
+        import struct
+        import tempfile
+        taxa = 22050
+        amostras = bytearray()
+        for freq, ms in melodias:
+            n = int(taxa * ms / 1000)
+            for i in range(n):
+                valor = int(12000 * _m.sin(2 * _m.pi * freq * i / taxa))
+                amostras += struct.pack("<h", valor)
+        cab = struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", 36 + len(amostras), b"WAVE",
+                          b"fmt ", 16, 1, 1, taxa, taxa * 2, 2, 16, b"data", len(amostras))
+        caminho = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as arq:
+                arq.write(cab + bytes(amostras))
+                caminho = arq.name
+            subprocess.Popen([tocador, caminho], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL).communicate(timeout=5)
+        except Exception:
+            pass
+        finally:
+            if caminho:
                 try:
-                    winsound.Beep(freq, ms)
-                except Exception:
-                    return
-        threading.Thread(target=run, daemon=True).start()
+                    os.unlink(caminho)
+                except OSError:
+                    pass
 
     def ciclo_observacao(self):
         if self.observar and not self.dormindo:
@@ -979,7 +1098,7 @@ class Pipo:
         j.title("Atividade no PC")
         j.attributes("-topmost", True)
         j.geometry("430x470")
-        caixa = tk.Text(j, wrap="word", font=("Consolas", 10), bg="#f7f9fc")
+        caixa = tk.Text(j, wrap="word", font=(F_MONO, 10), bg="#f7f9fc")
         caixa.pack(fill="both", expand=True, padx=6, pady=6)
         botao = tk.Button(j, text="Apagar todo o histórico")
         botao.pack(pady=(0, 6))
@@ -1234,15 +1353,15 @@ class Pipo:
         j.overrideredirect(True)
         j.attributes("-topmost", True)
         lab = tk.Label(j, text=texto, wraplength=230, justify="left", bg="#ffffff",
-                       fg="#222", font=("Segoe UI", 10), padx=10, pady=8, relief="solid", bd=1)
+                       fg="#222", font=(F_TEXTO, 10), padx=10, pady=8, relief="solid", bd=1)
         lab.pack()
         if fb:
             barra = tk.Frame(j, bg="#ffffff", highlightbackground="#999", highlightthickness=1)
             barra.pack(fill="x")
             if remix:
-                tk.Label(barra, text="frase nova", bg="#ffffff", fg="#888", font=("Segoe UI", 8)).pack(side="left", padx=6)
+                tk.Label(barra, text="frase nova", bg="#ffffff", fg="#888", font=(F_TEXTO, 8)).pack(side="left", padx=6)
             for rotulo, ok in (("não gostei", False), ("gostei", True)):
-                tk.Button(barra, text=rotulo, bd=0, bg="#ffffff", fg="#444", font=("Segoe UI", 8),
+                tk.Button(barra, text=rotulo, bd=0, bg="#ffffff", fg="#444", font=(F_TEXTO, 8),
                           command=lambda ok=ok: (self.dar_feedback(ok, fb), j.destroy())).pack(side="right", padx=4)
         self.balao_j = j
         self.posicionar(j, self.larg // 2 - 115, 0, acima=True)
@@ -1259,10 +1378,10 @@ class Pipo:
         tk.Button(cima, text="×", bd=0, bg="#f9e66b", command=j.destroy).pack(side="right")
         if fb:
             for rotulo, ok in (("não gostei", False), ("gostei", True)):
-                tk.Button(cima, text=rotulo, bd=0, bg="#f9e66b", fg="#554", font=("Segoe UI", 8),
+                tk.Button(cima, text=rotulo, bd=0, bg="#f9e66b", fg="#554", font=(F_TEXTO, 8),
                           command=lambda ok=ok: (self.dar_feedback(ok, fb), j.destroy())).pack(side="left", padx=3)
         tk.Label(j, text=texto, wraplength=200, justify="left", bg="#fff59d",
-                 fg="#333", font=("Segoe Print", 10), padx=10, pady=8).pack()
+                 fg="#333", font=(F_CANETA, 10), padx=10, pady=8).pack()
         self.posicionar(j, self.larg + 8, random.randint(-60, 40))
 
     # ----------------------------- notas -----------------------------
@@ -1279,7 +1398,7 @@ class Pipo:
         j.attributes("-topmost", True)
         j.geometry("320x120")
         tk.Label(j, text="O que eu anoto no bilhete?").pack(pady=(10, 4))
-        e = tk.Entry(j, font=("Segoe UI", 11))
+        e = tk.Entry(j, font=(F_TEXTO, 11))
         e.pack(fill="x", padx=12)
 
         def ok(_e=None):
@@ -1299,7 +1418,7 @@ class Pipo:
         j.title("Bilhetes")
         j.attributes("-topmost", True)
         j.geometry("360x300")
-        lb = tk.Listbox(j, font=("Segoe UI", 10))
+        lb = tk.Listbox(j, font=(F_TEXTO, 10))
         lb.pack(fill="both", expand=True, padx=6, pady=6)
         for n in self.notas:
             lb.insert("end", f"[{n['quando']}] {n['texto']}")
@@ -1324,15 +1443,15 @@ class Pipo:
         j.attributes("-topmost", True)
         j.geometry("360x420")
         # o campo de digitar entra primeiro, fixo embaixo, para nunca ser empurrado para fora
-        self.entrada = tk.Entry(j, font=("Segoe UI", 11), relief="solid", bd=1)
+        self.entrada = tk.Entry(j, font=(F_TEXTO, 11), relief="solid", bd=1)
         self.entrada.pack(side="bottom", fill="x", padx=6, pady=6, ipady=4)
         barra = tk.Frame(j)
         barra.pack(side="bottom", fill="x", padx=6)
         tk.Button(barra, text="gostei", command=lambda: self.dar_feedback(True)).pack(side="left")
         tk.Button(barra, text="não gostei", command=lambda: self.dar_feedback(False)).pack(side="left", padx=6)
-        tk.Label(barra, text="anota:  ensina:  /ajuda", fg="#777", font=("Segoe UI", 8)).pack(side="right")
+        tk.Label(barra, text="anota:  ensina:  /ajuda", fg="#777", font=(F_TEXTO, 8)).pack(side="right")
         self.texto = tk.Text(j, wrap="word", state="disabled", bg="#f7f9fc",
-                             font=("Segoe UI", 10), width=10, height=5)
+                             font=(F_TEXTO, 10), width=10, height=5)
         self.texto.pack(side="top", fill="both", expand=True, padx=6, pady=(6, 0))
         self.entrada.bind("<Return>", self.enviar)
         self.entrada.bind("<Button-1>", lambda _e: self.entrada.focus_force())
@@ -1488,7 +1607,7 @@ class Pipo:
         j.title("O que o Pipo aprendeu")
         j.attributes("-topmost", True)
         j.geometry("520x470")
-        caixa = tk.Text(j, wrap="word", font=("Consolas", 10), bg="#f7f9fc")
+        caixa = tk.Text(j, wrap="word", font=(F_MONO, 10), bg="#f7f9fc")
         caixa.pack(fill="both", expand=True, padx=6, pady=6)
         barra = tk.Frame(j)
         barra.pack(pady=(0, 6))
@@ -1504,11 +1623,8 @@ class Pipo:
             self.cerebro.treinar()
             atualizar()
 
-        def abrir_pasta():
-            try:
-                os.startfile(DADOS)
-            except Exception:
-                pass
+        def abrir_pasta_local():
+            abrir_pasta(DADOS)
 
         def esquecer():
             if not confirma["sim"]:
@@ -1520,7 +1636,7 @@ class Pipo:
             b_esq.config(text="Esquecer o que aprendi com você")
             atualizar()
         tk.Button(barra, text="Recarregar dados", command=recarregar).pack(side="left", padx=4)
-        tk.Button(barra, text="Abrir pasta de dados", command=abrir_pasta).pack(side="left", padx=4)
+        tk.Button(barra, text="Abrir pasta de dados", command=abrir_pasta_local).pack(side="left", padx=4)
         b_esq = tk.Button(barra, text="Esquecer o que aprendi com você", command=esquecer)
         b_esq.pack(side="left", padx=4)
         atualizar()
