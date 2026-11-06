@@ -32,6 +32,7 @@ import math
 import os
 import queue
 import random
+import re
 import threading
 import time
 import tkinter as tk
@@ -113,6 +114,7 @@ ARQ_HIST = PASTA / "historico.json"
 ARQ_ESTADO = PASTA / "estado.json"
 ARQ_ATIVIDADE = PASTA / "atividade.json"
 ARQ_CEREBRO = PASTA / "cerebro.json"
+ARQ_LEMBRETES = PASTA / "lembretes.json"
 TRANSP = "#ff00ff"
 
 
@@ -754,9 +756,11 @@ class Pipo:
         self.obs = Observador()
         self.ultima_pausa = 0.0
         self.cerebro = Cerebro(DADOS, ARQ_CEREBRO)
+        self.lembretes = carregar(ARQ_LEMBRETES, [])
         self.ultimo_id = None          # id da última frase mostrada (para o gostei/não gostei)
         self.ultima_pergunta = ""      # a última coisa que você disse (para o ensina:)
         self.arrasto = None
+        self.after_passeio = None      # id do after() do loop de passeio (evita loop duplo)
 
         self.desenhar_widget()
         self.desenhar_dinamico()
@@ -772,6 +776,7 @@ class Pipo:
         self.root.after(500, self.tick)
         self.root.after(INTERVALO_OBS * 1000, self.ciclo_observacao)
         self.root.after(60000, self.ciclo_auto)
+        self.root.after(1500, self.retomar_lembretes)
         self.agendar()
 
     def fpx(self, n):
@@ -1163,7 +1168,9 @@ class Pipo:
         self.definir_humor("feliz", 2)
         self.tocar("acordar")
         self.desenhar_dinamico()
-        self.root.after(30, self.loop_passeio)
+        if self.after_passeio:         # reentrada rápida: cancela o loop anterior antes de marcar outro
+            self.root.after_cancel(self.after_passeio)
+        self.after_passeio = self.root.after(30, self.loop_passeio)
 
     def sair_passeio(self):
         if self.modo != "passeio":
@@ -1175,6 +1182,9 @@ class Pipo:
             x = max(mon["x1"] + 10, min(x, mon["x2"] - LARGURA - 10))
             y = max(mon["wtopo"] + 10, min(y, mon["wbase"] - ALTURA - 10))
         self.modo, self.esc, self.walker = "tela", ESCALA, None
+        if self.after_passeio:                   # desliga o loop do passeio de vez
+            self.root.after_cancel(self.after_passeio)
+            self.after_passeio = None
         self.larg, self.alt, self.andando, self.olhar = LARGURA, ALTURA, False, 1
         self.cv.config(width=LARGURA, height=ALTURA)
         self.root.geometry(f"{LARGURA}x{ALTURA}+{x}+{y}")
@@ -1187,6 +1197,7 @@ class Pipo:
 
     def loop_passeio(self):
         if self.modo != "passeio" or self.walker is None:
+            self.after_passeio = None
             return
         w = self.walker
         self.cont += 1
@@ -1204,7 +1215,7 @@ class Pipo:
             self.ultimo_visual, self.olhar = visual, w.dir
             self.desenhar_dinamico()
         self.seguir_balao()
-        self.root.after(30, self.loop_passeio)
+        self.after_passeio = self.root.after(30, self.loop_passeio)
 
     def seguir_balao(self):
         j = self.balao_j
@@ -1346,6 +1357,11 @@ class Pipo:
     def escrever(self, quem, t):
         if not (self.chat and self.chat.winfo_exists()):
             return
+        # o widget Text interpreta tags tipo [chatmeta]...[/chatmeta] no texto
+        # inserido: um colchete vindo da LLM ou do remix poderia engolir a linha.
+        # Trocamos só os colchetes que parecem tag de configuração por equivalentes
+        # de largura total, que o Tk não interpreta e o usuário lê como colchetes.
+        t = re.sub(r"\[/?[A-Za-z][A-Za-z0-9_ -]{0,30}\]", lambda m: m.group(0).replace("[", "\uff3b").replace("]", "\uff3d"), str(t))
         self.texto.config(state="normal")
         self.texto.insert("end", f"{quem}: {t}\n\n")
         self.texto.config(state="disabled")
@@ -1445,11 +1461,33 @@ class Pipo:
             self.avaliar_auto()
 
     def agendar_lembrete(self, segundos, texto):
+        # guarda o instante alvo em disco: fechar o Pipo não perde mais o lembrete
+        self.lembretes.append({"para": time.time() + segundos, "texto": texto})
+        self._limpar_lembretes()
+        salvar(ARQ_LEMBRETES, self.lembretes)
         self.root.after(int(segundos * 1000), lambda: self.avisar_lembrete(texto))
+
+    def _limpar_lembretes(self):
+        limite = time.time() - 86400          # o que venceu há mais de um dia sai da lista
+        self.lembretes = [l for l in self.lembretes if l.get("para", 0) > limite]
+
+    def retomar_lembretes(self):
+        """Na abertura, remarca os lembretes futuros salvos (os vencidos são descartados)."""
+        agora = time.time()
+        for l in list(self.lembretes):
+            falta = l.get("para", 0) - agora
+            if 1 < falta < 86400:
+                self.root.after(int(falta * 1000), lambda t=l["texto"]: self.avisar_lembrete(t))
+        self._limpar_lembretes()
+        salvar(ARQ_LEMBRETES, self.lembretes)
 
     def avisar_lembrete(self, texto):
         self.definir_humor("surpreso", 4)
         self.postit(f"Lembrete: {texto}")
+        for l in list(self.lembretes):
+            if l.get("texto") == texto and abs(l.get("para", 0) - time.time()) < 3600:
+                self.lembretes.remove(l)
+        salvar(ARQ_LEMBRETES, self.lembretes)
 
     def dar_feedback(self, positivo, rid=None):
         rid = rid or self.ultimo_id
