@@ -44,6 +44,7 @@ except ImportError:
     winsound = None
 
 from cerebro import Cerebro, simplificar
+from llm import ClienteLLM, montar_instrucao
 
 # ------------------------------- configuração -------------------------------
 NOME = "Pipo"
@@ -77,6 +78,7 @@ REGRAS_AUTO = {
 }
 
 PERSONA_PADRAO = "fofinho"
+AVISO_IA = "Deixa eu pensar com a IA local..."
 PERSONAS = {
     "fofinho": {"nome": "Fofinho", "resumo": "carinhoso e bem-humorado", "cor": "#f6f2d2", "cor_sono": "#c9c9a0",
                 "saudacao": "Oi, oi! Voltei ao meu jeitinho fofo!",
@@ -754,6 +756,7 @@ class Pipo:
         self.obs = Observador()
         self.ultima_pausa = 0.0
         self.cerebro = Cerebro(DADOS, ARQ_CEREBRO)
+        self.llm = ClienteLLM.ligar(PASTA)     # None = desligado (comportamento antigo)
         self.ultimo_id = None          # id da última frase mostrada (para o gostei/não gostei)
         self.ultima_pergunta = ""      # a última coisa que você disse (para o ensina:)
         self.arrasto = None
@@ -1425,9 +1428,39 @@ class Pipo:
             self.dar_feedback(False)
             return
         self.ultima_pergunta = t
-        self.responder(t, self.cerebro.responder(t, self.persona, self.ctx_cerebro()))
+        r = self.cerebro.responder(t, self.persona, self.ctx_cerebro())
+        if r["intencao"] == "desconhecida" and self.llm:
+            # a IA local responde o que ele não sabe — em outra thread, para a
+            # janelinha nunca travar enquanto o modelo pensa.
+            self.hist = (self.hist + [["model", AVISO_IA]])[-20:]
+            self.escrever(NOME, AVISO_IA)
+            threading.Thread(target=self._perguntar_llm, args=(t,), daemon=True).start()
+            return
+        self.responder(t, r)
+
+    def _perguntar_llm(self, pergunta):
+        hist = [{"role": papel if papel == "user" else "model", "conteudo": tx}
+                for papel, tx in self.hist[-6:] if tx != AVISO_IA]
+        resposta = self.llm.perguntar(montar_instrucao(self.persona, self.cerebro.estado["fatos"]),
+                                      hist + [{"role": "user", "conteudo": pergunta}])
+        def aplicar():
+            if resposta:
+                rid = self.cerebro.rid(self.persona, "llm", resposta)
+                r = {"texto": resposta, "humor": "normal", "intencao": "llm",
+                     "origem": "ia local", "id": rid, "conf": 0.5, "acao": None}
+            else:                       # servidor fora do ar: cai no "não sei" de sempre
+                r = self.cerebro.responder(pergunta, self.persona, self.ctx_cerebro())
+            self.fila.put(lambda: self.responder(pergunta, r))
+        self.root.after(0, aplicar)     # a rede terminou; o resto tem que ser na thread da UI
 
     def responder(self, pergunta, r):
+        # o aviso de espera não entra no histórico; na tela ele sai quando a resposta chega
+        if self.hist and self.hist[-1] == ["model", AVISO_IA]:
+            self.hist.pop()
+            if self.chat and self.chat.winfo_exists():
+                self.texto.config(state="normal")
+                self.texto.delete("end-4l", "end")       # "...IA local...\n\n"
+                self.texto.config(state="disabled")
         self.hist = (self.hist + [["user", pergunta], ["model", r["texto"]]])[-20:]
         salvar(ARQ_HIST, self.hist)
         self.escrever(NOME, r["texto"])

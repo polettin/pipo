@@ -66,6 +66,18 @@ MODO REVOLTADO
   machucar ou de acabar com a própria vida, TODAS as personalidades respondem com acolhimento e indicam o
   CVV (188, 24 horas) e o SAMU (192). Isso está no cerebro.py (CRISE e ACOLHIMENTO).
 
+## Opcional: IA local (para quem quiser)
+
+O Pipo continua 100% offline por padrão: sem configuração nenhuma, nada muda. Se você já tem um modelo local com API no formato OpenAI (llama.cpp, vLLM, llama-swap), pode dar a ele uma segunda chance nas perguntas que ele não sabe responder:
+
+1. Sirva o modelo. Exemplo com llama.cpp e um Qwen de 0.8B:
+   `llama-server -m qwen3.5-0.8b.Q4_K_M.gguf --port 8080`
+2. Crie `llm.json` ao lado do `pipo_ml.py`:
+   `{"url": "http://127.0.0.1:8080/v1", "modelo": "qwen3.5-0.8b"}`
+   (ou use as variáveis `PIPO_LLM_URL` e `PIPO_LLM_MODEL`)
+
+Como funciona: o cérebro de sempre tenta primeiro (regras, o que você ensinou, machine learning). Só quando ele diria **"não sei"** é que a IA local responde — **nunca** nas horas em que você está mal (o acolhimento continua sendo o texto curado do projeto). A resposta da IA também aceita gostei/não gostei. Se o servidor não estiver de pé, ele simplesmente diz que não sabe, como sempre. Nada sai do seu computador: a URL é local e só você escolhe qual servidor responder.
+
 PRIVACIDADE
   Nada sai do computador. Ele guarda o nome dos programas e o tempo de uso (atividade.json), os bilhetes
   (notas.json), a conversa recente (historico.json), o que aprendeu (cerebro.json) e a posição (estado.json).
